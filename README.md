@@ -1,4 +1,4 @@
-﻿# Ironclad
+# Ironclad
 
 Ironclad is a UCI-compatible chess engine written in Rust. It uses `cozy-chess` for fast, legal bitboard move generation and implements its own iterative-deepening principal-variation search.
 
@@ -12,11 +12,11 @@ The executable is `target/release/ironclad` (or `ironclad.exe` on Windows). Add 
 
 ## UCI
 
-Ironclad supports `uci`, `isready`, `ucinewgame`, `position startpos|fen ... moves ...`, `go` with depth, movetime, clock/increment, movestogo, and infinite limits, `stop`, `ponderhit`, `setoption`, and `quit`.
+Ironclad supports `uci`, `isready`, `ucinewgame`, `position startpos|fen ... moves ...`, `go` with depth, movetime, clock/increment, movestogo, and infinite limits. A bare `go` continues searching until `stop`. Supported commands also include `ponderhit`, `setoption`, and `quit`.
 
 Options:
 
-- `Hash` (default 64 MB, range 1–2048)
+- `Hash` (default 64 MB, range 1-2048)
 - `Move Overhead` (default 20 ms)
 
 Typical terminal session:
@@ -34,7 +34,7 @@ go depth 12
 - Iterative deepening, aspiration windows, principal-variation search, alpha-beta pruning, and quiescence search.
 - Transposition table with exact/lower/upper bounds and mate-distance normalization.
 - MVV-LVA capture ordering, hash/PV moves, killer moves, and history heuristic.
-- Material and piece-square evaluation with tempo bonus.
+- Material and piece-square evaluation with bishop-pair and pawn-structure terms.
 - Asynchronous search so the UCI loop can receive `stop` while thinking.
 
 ## License
