@@ -1,0 +1,4 @@
+﻿/target
+*.pgn
+*.log
+.DS_Store

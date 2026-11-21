@@ -1,0 +1,15 @@
+﻿[package]
+name = "ironclad"
+version = "0.1.0"
+edition = "2021"
+description = "Ironclad: a fast UCI chess engine written in Rust"
+license = "MIT"
+
+[dependencies]
+cozy-chess = "0.3.4"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
