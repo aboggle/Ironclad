@@ -1,3 +1,4 @@
+mod chess;
 mod eval;
 mod search;
 mod uci;

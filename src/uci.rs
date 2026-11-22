@@ -1,5 +1,5 @@
 use crate::search::Searcher;
-use cozy_chess::{Board, Color, Move};
+use cozy_chess::{Board, Color};
 use std::io::{self, BufRead, Write};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -146,7 +146,7 @@ pub fn run() {
                 }
                 if let Some(m) = moves_pos {
                     for s in &parts[m + 1..] {
-                        if let Ok(mv) = Move::from_str(s) {
+                        if let Ok(mv) = crate::chess::parse_uci_move(&board, s) {
                             if board.try_play(mv).is_err() {
                                 eprintln!("info string illegal move {s}");
                                 break;

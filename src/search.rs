@@ -70,7 +70,11 @@ impl Searcher {
         out
     }
     fn capture_value(board: &Board, mv: Move) -> i32 {
-        let victim = board.piece_on(mv.to).map_or(0, |p| VALUES[p as usize]);
+        let victim = if crate::chess::is_en_passant(board, mv) {
+            VALUES[Piece::Pawn as usize]
+        } else {
+            board.piece_on(mv.to).map_or(0, |p| VALUES[p as usize])
+        };
         let attacker = board.piece_on(mv.from).map_or(0, |p| VALUES[p as usize]);
         victim * 16 - attacker
     }
@@ -80,11 +84,7 @@ impl Searcher {
             if Some(m) == hash {
                 return 2_000_000;
             }
-            if board.piece_on(m.to).is_some()
-                || (board.piece_on(m.from) == Some(Piece::Pawn)
-                    && board.en_passant().is_some()
-                    && m.to.file() == board.en_passant().unwrap())
-            {
+            if crate::chess::is_capture(board, m) {
                 return 1_000_000 + Self::capture_value(board, m);
             }
             if m.promotion.is_some() {
@@ -159,7 +159,7 @@ impl Searcher {
         }
         self.order(board, &mut moves, None, ply);
         for mv in moves {
-            if !in_check && board.piece_on(mv.to).is_none() && mv.promotion.is_none() {
+            if !in_check && !crate::chess::is_capture(board, mv) && mv.promotion.is_none() {
                 continue;
             }
             let mut child = board.clone();
@@ -221,7 +221,7 @@ impl Searcher {
         let mut best_move = None;
         let mut legal = 0;
         for (i, mv) in moves.iter().copied().enumerate() {
-            let capture = board.piece_on(mv.to).is_some();
+            let capture = crate::chess::is_capture(board, mv);
             let pawn_move = board.piece_on(mv.from) == Some(Piece::Pawn);
             let mut child = board.clone();
             child.play_unchecked(mv);
@@ -347,10 +347,7 @@ impl Searcher {
                 self.nodes as u128 * 1000 / elapsed,
                 self.tt.iter().take(1000).filter(|e| e.is_some()).count() / 10,
                 elapsed,
-                pv.iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(" ")
+                crate::chess::format_pv(&board, &pv)
             );
             let _ = io::stdout().flush();
             if score.abs() > MATE - 1000 {
@@ -359,7 +356,10 @@ impl Searcher {
         }
         println!(
             "bestmove {}",
-            best.map_or_else(|| "0000".to_string(), |m| m.to_string())
+            best.map_or_else(
+                || "0000".to_string(),
+                |m| crate::chess::format_uci_move(&board, m)
+            )
         );
         let _ = io::stdout().flush();
     }

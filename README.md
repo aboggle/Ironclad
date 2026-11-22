@@ -12,7 +12,7 @@ The executable is `target/release/ironclad` (or `ironclad.exe` on Windows). Add 
 
 ## UCI
 
-Ironclad supports `uci`, `isready`, `ucinewgame`, `position startpos|fen ... moves ...`, `go` with depth, movetime, clock/increment, movestogo, and infinite limits. A bare `go` continues searching until `stop`. Supported commands also include `ponderhit`, `setoption`, and `quit`.
+Ironclad supports `uci`, `isready`, `ucinewgame`, `position startpos|fen ... moves ...`, `go` with depth, movetime, clock/increment, movestogo, and infinite limits. A bare `go` continues searching until `stop`. Standard UCI castling notation and en-passant moves are supported. Other commands include `ponderhit`, `setoption`, and `quit`.
 
 Options:
 
