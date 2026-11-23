@@ -12,7 +12,7 @@ The executable is `target/release/ironclad` (or `ironclad.exe` on Windows). Add 
 
 ## UCI
 
-Ironclad supports `uci`, `isready`, `ucinewgame`, `position startpos|fen ... moves ...`, `go` with depth, movetime, clock/increment, movestogo, and infinite limits. A bare `go` continues searching until `stop`. Standard UCI castling notation and en-passant moves are supported. Other commands include `ponderhit`, `setoption`, and `quit`.
+Ironclad supports `uci`, `isready`, `ucinewgame`, `position startpos|fen ... moves ...`, and `go` with depth, movetime, clock/increment, movestogo, and infinite limits. A bare `go` continues searching until `stop`. Standard UCI castling notation and en-passant moves are supported.
 
 Options:
 
@@ -32,9 +32,9 @@ go depth 12
 
 - Legal move generation and incremental Zobrist hashing from cozy-chess.
 - Iterative deepening, aspiration windows, principal-variation search, alpha-beta pruning, and quiescence search.
-- Transposition table with exact/lower/upper bounds and mate-distance normalization.
+- Persistent transposition table with exact/lower/upper bounds and mate-distance normalization.
 - MVV-LVA capture ordering, hash/PV moves, killer moves, and history heuristic.
-- Material and piece-square evaluation with bishop-pair and pawn-structure terms.
+- Tapered material and piece-square evaluation with mobility, king safety, bishop-pair, and pawn-structure terms.
 - Asynchronous search so the UCI loop can receive `stop` while thinking.
 
 ## License

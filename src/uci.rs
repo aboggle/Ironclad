@@ -1,9 +1,9 @@
-use crate::search::Searcher;
+use crate::search::{SearchParams, Searcher, Tt};
 use cozy_chess::{Board, Color};
 use std::io::{self, BufRead, Write};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -80,25 +80,66 @@ fn parse_go(words: &[&str]) -> Limits {
                     i += 1;
                 }
             }
-            "infinite" | "ponder" => l.infinite = true,
+            "infinite" => l.infinite = true,
             _ => {}
         }
         i += 1;
     }
     l
 }
-fn stop_search(handle: &mut Option<(Arc<AtomicBool>, JoinHandle<()>)>) {
-    if let Some((flag, thread)) = handle.take() {
-        flag.store(true, Ordering::Relaxed);
-        let _ = thread.join();
+
+/// Time budget for a move, in milliseconds. Splits the clock across the
+/// expected remaining moves, adds most of the increment, keeps a safety
+/// margin for overhead, and falls back to nearly all remaining time in an
+/// emergency (when the clock is almost gone).
+fn time_budget(l: &Limits, side: Color, overhead: u64) -> Option<u64> {
+    if let Some(ms) = l.movetime {
+        return Some(ms.saturating_sub(overhead).max(1));
+    }
+    if l.infinite {
+        return None;
+    }
+    let (time, inc) = if side == Color::White {
+        (l.wtime?, l.winc)
+    } else {
+        (l.btime?, l.binc)
+    };
+    let usable = time.saturating_sub(overhead);
+    if usable < 50 {
+        // Emergency: burn most of what is left rather than flag.
+        return Some(time.saturating_sub(5).max(1));
+    }
+    let mtg = l.movestogo.unwrap_or(20).max(1);
+    let base = usable / mtg + inc * 3 / 4;
+    Some(base.min(usable * 6 / 10).max(1))
+}
+
+struct SearchHandle {
+    stop: Arc<AtomicBool>,
+    handle: JoinHandle<()>,
+}
+fn stop_search(handle: &mut Option<SearchHandle>) {
+    if let Some(h) = handle.take() {
+        h.stop.store(true, Ordering::Relaxed);
+        let _ = h.handle.join();
     }
 }
+
+const OPTIONS: &str = "id name Ironclad 0.1.0\nid author OpenAI\n\
+    option name Hash type spin default 64 min 1 max 2048\n\
+    option name Move Overhead type spin default 20 min 0 max 500\n\
+    uciok";
+
 pub fn run() {
     let stdin = io::stdin();
     let mut board = Board::default();
     let mut hash_mb = 64usize;
     let mut overhead = 20u64;
-    let mut search: Option<(Arc<AtomicBool>, JoinHandle<()>)> = None;
+    // Persistent hash table: survives across searches, cleared on ucinewgame.
+    let mut tt: Option<Arc<Tt>> = None;
+    // Hashes of the positions played before the root (repetition detection).
+    let mut history: Vec<u64> = Vec::new();
+    let mut search: Option<SearchHandle> = None;
     for line in stdin.lock().lines() {
         let Ok(line) = line else { break };
         let line = line.trim();
@@ -107,21 +148,28 @@ pub fn run() {
         }
         let parts: Vec<&str> = line.split_whitespace().collect();
         match parts[0] {
-            "uci" => {
-                println!("id name Ironclad 0.1.0\nid author OpenAI\noption name Hash type spin default 64 min 1 max 2048\noption name Move Overhead type spin default 20 min 0 max 500\nuciok");
-            }
+            "uci" => println!("{OPTIONS}"),
             "isready" => println!("readyok"),
             "setoption" => {
                 let name_pos = parts.iter().position(|&x| x == "name");
                 let value_pos = parts.iter().position(|&x| x == "value");
                 if let (Some(n), Some(v)) = (name_pos, value_pos) {
-                    let name = parts[n + 1..v].join(" ");
-                    if let Ok(value) = parts[v + 1].parse::<usize>() {
-                        if name.eq_ignore_ascii_case("Hash") {
-                            hash_mb = value.clamp(1, 2048);
-                        }
-                        if name.eq_ignore_ascii_case("Move Overhead") {
-                            overhead = value.min(500) as u64;
+                    if n + 1 >= v || v + 1 >= parts.len() {
+                        continue;
+                    }
+                    let name = parts[n + 1..v].join(" ").to_ascii_lowercase();
+                    let raw = parts[v + 1];
+                    if let Ok(value) = raw.parse::<i32>() {
+                        match name.as_str() {
+                            "hash" => {
+                                let mb = value.clamp(1, 2048) as usize;
+                                if mb != hash_mb {
+                                    hash_mb = mb;
+                                    tt = None; // resized on the next search
+                                }
+                            }
+                            "move overhead" => overhead = value.clamp(0, 500) as u64,
+                            _ => {}
                         }
                     }
                 }
@@ -129,6 +177,9 @@ pub fn run() {
             "ucinewgame" => {
                 stop_search(&mut search);
                 board = Board::default();
+                history.clear();
+                // Fresh game, fresh hash table (rebuilt on the next search).
+                tt = None;
             }
             "position" => {
                 stop_search(&mut search);
@@ -144,6 +195,8 @@ pub fn run() {
                         eprintln!("info string invalid FEN");
                     }
                 }
+                history.clear();
+                history.push(board.hash());
                 if let Some(m) = moves_pos {
                     for s in &parts[m + 1..] {
                         if let Ok(mv) = crate::chess::parse_uci_move(&board, s) {
@@ -151,47 +204,39 @@ pub fn run() {
                                 eprintln!("info string illegal move {s}");
                                 break;
                             }
+                            history.push(board.hash());
                         } else {
                             break;
                         }
                     }
                 }
+                // The root position itself must not count as its own history.
+                history.pop();
             }
             "go" => {
                 stop_search(&mut search);
                 let l = parse_go(&parts);
                 let side = board.side_to_move();
-                let budget = if let Some(ms) = l.movetime {
-                    Some(ms.saturating_sub(overhead).max(1))
-                } else if !l.infinite {
-                    let (time, inc) = if side == Color::White {
-                        (l.wtime, l.winc)
-                    } else {
-                        (l.btime, l.binc)
-                    };
-                    time.map(|t| {
-                        let mtg = l.movestogo.unwrap_or(30).max(1);
-                        (t.saturating_sub(overhead) / mtg + inc * 3 / 4)
-                            .min(t.saturating_sub(overhead).max(1))
-                            .max(1)
-                    })
-                } else {
-                    None
-                };
+                let budget = time_budget(&l, side, overhead);
                 let deadline = budget.map(|ms| Instant::now() + Duration::from_millis(ms));
                 let flag = Arc::new(AtomicBool::new(false));
-                let f = flag.clone();
+                let dl = Arc::new(Mutex::new(deadline));
+                let tt_arc = tt.get_or_insert_with(|| Arc::new(Tt::new(hash_mb))).clone();
+                let params = SearchParams {
+                    tt: tt_arc.clone(),
+                    stop: flag.clone(),
+                    deadline: dl.clone(),
+                    root_history: history.clone(),
+                };
                 let b = board.clone();
-                search = Some((
-                    flag,
-                    thread::spawn(move || {
-                        let mut s = Searcher::new(hash_mb, f.clone(), deadline);
-                        s.run(b, l.depth);
-                    }),
-                ));
+                let depth = l.depth;
+                let handle = thread::spawn(move || {
+                    let mut s = Searcher::new(params);
+                    s.run(b, depth);
+                });
+                search = Some(SearchHandle { stop: flag, handle });
             }
             "stop" => stop_search(&mut search),
-            "ponderhit" => {}
             "quit" => {
                 stop_search(&mut search);
                 break;

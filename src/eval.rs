@@ -1,18 +1,5 @@
-//! Evaluation with a **necessity-driven** philosophy.
-//!
-//! Classical chess principles (castle early, hide the king, develop fast) are
-//! treated as *emergency responses*, not defaults:
-//!
-//! - **King danger** is measured concretely (enemy pieces attacking the king
-//!   zone, open/semi-open files and enemy majors aimed at it). Castling and
-//!   king runs become attractive only when danger demands them.
-//! - **Flexibility**: while the king is safe and uncommitted, a small bonus
-//!   rewards keeping options open — delayed castling and creative, modern
-//!   piece play are preferred when the position is quiet.
-//! - **Aggression is symmetric**: pressuring the enemy king raises *their*
-//!   danger, so one metric drives both attack and defense.
-//! - **Guardrail**: style terms are tiny compared to material, so principles
-//!   are broken only when concrete factors justify it.
+//! A small tapered evaluation of material, piece placement, mobility, pawns,
+//! bishop pair, and king safety.
 
 use cozy_chess::{BitBoard, Board, Color, Piece, Square};
 
@@ -37,11 +24,6 @@ const DANGER_MELEE: i32 = 6;
 const DANGER_OPEN_FILE: i32 = 12;
 const DANGER_SEMI_OPEN_FILE: i32 = 8;
 const DANGER_ENEMY_MAJOR: i32 = 14;
-
-/// Reward for an uncommitted king while it is safe (mg only).
-const FLEXIBILITY: i32 = 10;
-/// Danger at which the flexibility reward has fully faded.
-const FLEX_FADE: i32 = 24;
 
 const KNIGHT_DELTAS: [(i8, i8); 8] = [
     (1, 2),
@@ -126,16 +108,20 @@ pub fn evaluate(board: &Board) -> i32 {
             king_sq[ci] = square;
         }
 
-        // Piece-square terms (mg / eg). The king is deliberately flat in the
-        // middlegame: safety comes from the danger metric, not from a corner
-        // bias — keeping the king flexible is a feature, not a bug.
+        // Keep the king safer in the middlegame and centralize it in the endgame.
         let (pos_mg, pos_eg) = match piece {
-            Piece::Pawn => (rank as i32 * 6 + center as i32 * 2, rank as i32 * 10 + center as i32),
+            // Middlegame pawn advancement is deliberately mild: a speculative
+            // flank push must not out-score concrete king safety. Endgame
+            // advancement is where pawn pushes really pay.
+            Piece::Pawn => (
+                rank as i32 * 2 + center as i32 * 2,
+                rank as i32 * 10 + center as i32,
+            ),
             Piece::Knight => (center as i32 * 7, center as i32 * 5),
             Piece::Bishop => (center as i32 * 4, center as i32 * 5),
             Piece::Rook => (rank as i32 * 2, rank as i32 * 3 + center as i32),
             Piece::Queen => (center as i32 * 2, center as i32 * 3),
-            Piece::King => (0, center as i32 * 7),
+            Piece::King => (-(center as i32) * 5, center as i32 * 7),
         };
         mg += sign * pos_mg;
         eg += sign * pos_eg;
@@ -168,6 +154,10 @@ pub fn evaluate(board: &Board) -> i32 {
         let sign = if color == Color::White { 1 } else { -1 };
 
         // Doubled and isolated penalties, passed-pawn bonuses.
+        for pawns_on_file in &pawn_mask[ci] {
+            let count = pawns_on_file.count_ones() as i32;
+            white_score -= sign * count.saturating_sub(1) * 11;
+        }
         for sq in board.pieces(Piece::Pawn) {
             if board.color_on(sq) != Some(color) {
                 continue;
@@ -175,11 +165,16 @@ pub fn evaluate(board: &Board) -> i32 {
             let file = sq.file() as usize;
             let rel_rank = sq.relative_to(color).rank() as usize;
             let abs_rank = sq.rank() as usize;
-            if pawn_mask[ci][file].count_ones() > 1 {
-                white_score -= sign * 11;
-            }
-            let left = if file == 0 { 0 } else { pawn_mask[ci][file - 1] };
-            let right = if file == 7 { 0 } else { pawn_mask[ci][file + 1] };
+            let left = if file == 0 {
+                0
+            } else {
+                pawn_mask[ci][file - 1]
+            };
+            let right = if file == 7 {
+                0
+            } else {
+                pawn_mask[ci][file + 1]
+            };
             if left == 0 && right == 0 {
                 white_score -= sign * 10;
             }
@@ -189,13 +184,11 @@ pub fn evaluate(board: &Board) -> i32 {
             } else {
                 (1u8 << abs_rank) - 1
             };
-            let mut passed = true;
-            for ff in file.saturating_sub(1)..=(file + 1).min(7) {
-                if pawn_mask[1 - ci][ff] & ahead_mask != 0 {
-                    passed = false;
-                    break;
-                }
-            }
+            let passed = pawn_mask[1 - ci]
+                .iter()
+                .take((file + 1).min(7) + 1)
+                .skip(file.saturating_sub(1))
+                .all(|&pawns| pawns & ahead_mask == 0);
             if passed {
                 let r = rel_rank as i32;
                 white_score += sign * (10 + r * r * 3);
@@ -217,18 +210,8 @@ pub fn evaluate(board: &Board) -> i32 {
         white_score -= sign * danger;
         white_eg -= sign * danger * 2 / 5;
 
-        // Flexibility: reward an uncommitted king while it is safe. This is
-        // what lets the engine delay castling until danger makes it necessary.
-        let king = king_sq[ci];
-        let committed = matches!(king.file() as usize, 2 | 6); // c- or g-file
-        let home_area = king.relative_to(color).rank() as usize <= 1;
-        if !committed && home_area {
-            let fade = (FLEX_FADE - danger).clamp(0, FLEX_FADE);
-            white_score += sign * FLEXIBILITY * fade / FLEX_FADE;
-        }
-
         // A king marching forward in the middlegame is a liability.
-        let rel_rank = king.relative_to(color).rank() as usize;
+        let rel_rank = king_sq[ci].relative_to(color).rank() as usize;
         if rel_rank >= 3 {
             white_score -= sign * ((rel_rank - 2) as i32) * 10;
         }
@@ -334,7 +317,9 @@ fn attacks_zone(from: Square, piece: Piece, color: Color, occ: BitBoard, zone: B
     match piece {
         Piece::Pawn => {
             let dir = if color == Color::White { 1i8 } else { -1i8 };
-            [-1i8, 1].iter().any(|&df| from.try_offset(df, dir).is_some_and(hits))
+            [-1i8, 1]
+                .iter()
+                .any(|&df| from.try_offset(df, dir).is_some_and(hits))
         }
         Piece::Knight | Piece::King => {
             let deltas = if piece == Piece::Knight {
@@ -458,23 +443,22 @@ mod tests {
     }
 
     #[test]
-    fn safe_uncastled_king_keeps_the_flexibility_bonus() {
-        // Quiet position, no pressure: keeping the king uncommitted should be
-        // at least as good as having already castled (the "creative" feature).
-        let quiet_uncastled = eval("r3k2r/pppppppp/8/8/8/8/PPPPPPPP/R3K2R w KQkq - 0 1");
-        let quiet_castled = eval("r4rk1/pppppppp/8/8/8/8/PPPPPPPP/R4RK1 w - - 0 1");
+    fn castled_kings_are_safer_in_the_middlegame() {
+        let uncastled = eval("r4rk1/pppppppp/8/8/8/8/PPPPPPPP/R3K2R w KQ - 0 1");
+        let castled = eval("r3k2r/pppppppp/8/8/8/8/PPPPPPPP/R4RK1 w kq - 0 1");
         assert!(
-            quiet_uncastled >= quiet_castled,
-            "uncastled {quiet_uncastled} should not be worse than castled {quiet_castled}"
+            castled > uncastled,
+            "castled {castled} should beat uncastled {uncastled}"
         );
     }
 
     #[test]
     fn danger_makes_castling_necessary() {
-        // Same structure, but a black rook stares down the e-file at the king:
-        // now castling is concretely better (principles as emergency measure).
-        let pressured = eval("4r1k1/pppppppp/8/8/8/8/PPPPPPPP/R3K2R w KQ - 0 1");
-        let castled = eval("4r1k1/pppppppp/8/8/8/8/PPPPPPPP/R4RK1 w - - 0 1");
+        // Equal material; a black rook stares down the e-file at the white
+        // king: now castling is concretely better (principles as emergency
+        // measure), while the quiet test above prefers keeping options open.
+        let pressured = eval("r3r1k1/pppppppp/8/8/8/8/PPPPPPPP/R3K2R w KQ - 0 1");
+        let castled = eval("r3r1k1/pppppppp/8/8/8/8/PPPPPPPP/R4RK1 w - - 0 1");
         assert!(
             castled > pressured,
             "castled {castled} should beat staying {pressured} under pressure"

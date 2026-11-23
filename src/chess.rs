@@ -20,8 +20,7 @@ pub fn is_en_passant(board: &Board, mv: Move) -> bool {
 /// (king-captures-rook). Detect that pattern so castling is never mistaken
 /// for a capture or an attack on the rook.
 pub fn is_castling(board: &Board, mv: Move) -> bool {
-    board.piece_on(mv.from) == Some(Piece::King)
-        && board.color_on(mv.to) == board.color_on(mv.from)
+    board.piece_on(mv.from) == Some(Piece::King) && board.color_on(mv.to) == board.color_on(mv.from)
 }
 
 pub fn is_capture(board: &Board, mv: Move) -> bool {
