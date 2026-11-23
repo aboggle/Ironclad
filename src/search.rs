@@ -9,6 +9,7 @@ const INF: i32 = 32_000;
 const MATE: i32 = 30_000;
 const MAX_PLY: usize = 128;
 const VALUES: [i32; 6] = [100, 320, 335, 500, 950, 0];
+const HISTORY_LIMIT: i32 = 20_000;
 /// Number of independently locked hash-table shards.
 const TT_SHARDS: usize = 128;
 
@@ -184,6 +185,17 @@ impl Searcher {
         }
         false
     }
+    fn draw_score(&self, board: &Board, key: u64, ply: usize, fictional: bool) -> Option<i32> {
+        if !self.is_draw(board, key, ply, fictional) {
+            return None;
+        }
+        // Checkmate takes precedence over the fifty-move and repetition draws.
+        if !board.checkers().is_empty() && !board.generate_moves(|_| true) {
+            Some(-MATE + ply as i32)
+        } else {
+            Some(0)
+        }
+    }
     fn generate(board: &Board) -> Vec<Move> {
         let mut out = Vec::with_capacity(64);
         board.generate_moves(|group| {
@@ -193,11 +205,13 @@ impl Searcher {
         out
     }
     fn has_non_pawn_material(board: &Board) -> bool {
-        let majors = board.pieces(Piece::Knight)
-            | board.pieces(Piece::Bishop)
-            | board.pieces(Piece::Rook)
-            | board.pieces(Piece::Queen);
-        !(majors & board.colors(board.side_to_move())).is_empty()
+        let own = board.colors(board.side_to_move());
+        let majors = board.pieces(Piece::Rook) | board.pieces(Piece::Queen);
+        if !(majors & own).is_empty() {
+            return true;
+        }
+        let minors = (board.pieces(Piece::Knight) | board.pieces(Piece::Bishop)) & own;
+        minors.len() >= 2
     }
     fn capture_value(board: &Board, mv: Move) -> i32 {
         let victim = if is_en_passant(board, mv) {
@@ -208,6 +222,96 @@ impl Searcher {
         let attacker = board.piece_on(mv.from).map_or(0, |p| VALUES[p as usize]);
         victim * 16 - attacker
     }
+    /// Material gain from a capture sequence, assuming each side uses its
+    /// least valuable legal recapture. Legal move generation handles pins,
+    /// king captures, and x-rays as pieces leave the target square.
+    fn static_exchange(board: &Board, mv: Move) -> i32 {
+        if !is_capture(board, mv) {
+            return mv.promotion.map_or(0, |piece| {
+                VALUES[piece as usize] - VALUES[Piece::Pawn as usize]
+            });
+        }
+
+        let victim = if is_en_passant(board, mv) {
+            VALUES[Piece::Pawn as usize]
+        } else {
+            board
+                .piece_on(mv.to)
+                .map_or(0, |piece| VALUES[piece as usize])
+        };
+        let mut gains = [0; 32];
+        gains[0] = victim
+            + mv.promotion.map_or(0, |piece| {
+                VALUES[piece as usize] - VALUES[Piece::Pawn as usize]
+            });
+
+        let mut position = board.clone();
+        let mut occupant = mv
+            .promotion
+            .or_else(|| board.piece_on(mv.from))
+            .unwrap_or(Piece::Pawn);
+        position.play_unchecked(mv);
+        let mut depth = 0;
+
+        while depth + 1 < gains.len() {
+            let Some(reply) = Self::least_attacker(&position, mv.to) else {
+                break;
+            };
+
+            depth += 1;
+            gains[depth] = VALUES[occupant as usize] - gains[depth - 1];
+            let attacker = position.piece_on(reply.from).unwrap_or(Piece::Pawn);
+            if let Some(promotion) = reply.promotion {
+                gains[depth] += VALUES[promotion as usize] - VALUES[Piece::Pawn as usize];
+                occupant = promotion;
+            } else {
+                occupant = attacker;
+            }
+            position.play_unchecked(reply);
+        }
+
+        while depth > 0 {
+            gains[depth - 1] = -(-gains[depth - 1]).max(gains[depth]);
+            depth -= 1;
+        }
+        gains[0]
+    }
+    fn least_attacker(board: &Board, target: cozy_chess::Square) -> Option<Move> {
+        for piece in [
+            Piece::Pawn,
+            Piece::Knight,
+            Piece::Bishop,
+            Piece::Rook,
+            Piece::Queen,
+            Piece::King,
+        ] {
+            for from in board.colors(board.side_to_move()) {
+                if board.piece_on(from) != Some(piece)
+                    || !attacks_square(board, from, target, piece, board.side_to_move())
+                {
+                    continue;
+                }
+                let promotion = (piece == Piece::Pawn
+                    && target.relative_to(board.side_to_move()).rank() as usize == 7)
+                    .then_some(Piece::Queen);
+                let mv = Move {
+                    from,
+                    to: target,
+                    promotion,
+                };
+                if board.is_legal(mv) {
+                    return Some(mv);
+                }
+            }
+        }
+        None
+    }
+    fn update_history(&mut self, side: usize, mv: Move, bonus: i32) {
+        let bonus = bonus.clamp(-HISTORY_LIMIT, HISTORY_LIMIT);
+        let value = &mut self.history[side][mv.from as usize][mv.to as usize];
+        *value += bonus - *value * bonus.abs() / HISTORY_LIMIT;
+        *value = (*value).clamp(-HISTORY_LIMIT, HISTORY_LIMIT);
+    }
     fn order(&self, board: &Board, moves: &mut [Move], hash: Option<Move>, ply: usize) {
         let side = board.side_to_move() as usize;
         moves.sort_unstable_by_key(|&m| {
@@ -215,10 +319,12 @@ impl Searcher {
                 return 2_000_000;
             }
             if is_capture(board, m) {
-                return 1_000_000 + Self::capture_value(board, m);
+                let see = Self::static_exchange(board, m);
+                let good_capture_bonus = if see >= 0 { 1_000_000 } else { 100_000 };
+                return good_capture_bonus + see * 8 + Self::capture_value(board, m);
             }
-            if m.promotion.is_some() {
-                return 900_000;
+            if let Some(promotion) = m.promotion {
+                return 900_000 + Self::static_exchange(board, m) + VALUES[promotion as usize];
             }
             // Castling is quiet but worth finding early.
             if is_castling(board, m) {
@@ -267,17 +373,28 @@ impl Searcher {
             score
         }
     }
-    fn quiescence(&mut self, board: &Board, mut alpha: i32, beta: i32, ply: usize) -> i32 {
+    fn quiescence(
+        &mut self,
+        board: &Board,
+        mut alpha: i32,
+        beta: i32,
+        ply: usize,
+        fictional: bool,
+    ) -> i32 {
         self.nodes += 1;
         self.seldepth = self.seldepth.max(ply);
         if self.poll() {
             return crate::eval::evaluate(board);
         }
-        if board.halfmove_clock() >= 100 {
-            return 0;
-        }
         if ply >= MAX_PLY - 1 {
             return crate::eval::evaluate(board);
+        }
+        let key = board.hash();
+        if let Some(score) = self.draw_score(board, key, ply, fictional) {
+            return score;
+        }
+        if !fictional {
+            self.hash_path[ply] = key;
         }
         let in_check = !board.checkers().is_empty();
         let stand = crate::eval::evaluate(board);
@@ -303,8 +420,11 @@ impl Searcher {
             if !in_check && !is_capture(board, mv) && mv.promotion.is_none() {
                 continue;
             }
-            // Delta pruning: hopeless captures are not worth searching.
-            if !in_check && mv.promotion.is_none() {
+            let mut child = board.clone();
+            child.play_unchecked(mv);
+            // Keep checking captures out of delta pruning because their
+            // tactical value may exceed the material on the target square.
+            if !in_check && mv.promotion.is_none() && child.checkers().is_empty() {
                 let victim = if is_en_passant(board, mv) {
                     VALUES[Piece::Pawn as usize]
                 } else {
@@ -314,9 +434,7 @@ impl Searcher {
                     continue;
                 }
             }
-            let mut child = board.clone();
-            child.play_unchecked(mv);
-            let score = -self.quiescence(&child, -beta, -alpha, ply + 1);
+            let score = -self.quiescence(&child, -beta, -alpha, ply + 1, fictional);
             if self.stop.load(Ordering::Relaxed) {
                 return alpha;
             }
@@ -339,7 +457,7 @@ impl Searcher {
         fictional: bool,
     ) -> i32 {
         if depth <= 0 {
-            return self.quiescence(board, alpha, beta, ply);
+            return self.quiescence(board, alpha, beta, ply, fictional);
         }
         self.nodes += 1;
         self.seldepth = self.seldepth.max(ply);
@@ -351,8 +469,8 @@ impl Searcher {
         }
         let key = board.hash();
 
-        if self.is_draw(board, key, ply, fictional) {
-            return 0;
+        if let Some(score) = self.draw_score(board, key, ply, fictional) {
+            return score;
         }
         if !fictional {
             self.hash_path[ply] = key;
@@ -379,6 +497,7 @@ impl Searcher {
         if ply > 0
             && depth >= 3
             && !in_check
+            && beta > -MATE + 1000
             && beta < MATE - 1000
             && Self::has_non_pawn_material(board)
         {
@@ -398,7 +517,11 @@ impl Searcher {
                 }
                 if score >= beta {
                     if depth < 7 {
-                        return beta;
+                        return if board.generate_moves(|_| true) {
+                            beta
+                        } else {
+                            0
+                        };
                     }
                     let verify = self.search(board, depth - 1, beta - 1, beta, ply, pv, fictional);
                     if verify >= beta {
@@ -414,10 +537,14 @@ impl Searcher {
         if ply > 0 && !in_check && !pv && depth <= 6 {
             let static_eval = crate::eval::evaluate(board);
             if beta < MATE - 1000 && static_eval - (80 + 100 * depth) >= beta {
-                return beta;
+                return if board.generate_moves(|_| true) {
+                    beta
+                } else {
+                    0
+                };
             }
             if depth <= 2 && static_eval + 300 * depth < alpha {
-                return self.quiescence(board, alpha, beta, ply);
+                return self.quiescence(board, alpha, beta, ply, fictional);
             }
         }
 
@@ -429,6 +556,7 @@ impl Searcher {
         let mut best_score = -INF;
         let mut best_move = None;
         let mut legal = 0;
+        let history_side = board.side_to_move() as usize;
         for (i, mv) in moves.iter().copied().enumerate() {
             let capture = is_capture(board, mv);
             let pawn_move = board.piece_on(mv.from) == Some(Piece::Pawn);
@@ -442,7 +570,7 @@ impl Searcher {
                 next_depth += 1;
             }
             let score = if i == 0 {
-                -self.search(&child, next_depth, -beta, -alpha, ply + 1, pv, false)
+                -self.search(&child, next_depth, -beta, -alpha, ply + 1, pv, fictional)
             } else {
                 let reduction = if depth >= 3
                     && i >= 4
@@ -463,7 +591,7 @@ impl Searcher {
                     -alpha,
                     ply + 1,
                     false,
-                    false,
+                    fictional,
                 );
                 if s > alpha && reduction > 0 {
                     s = -self.search(
@@ -473,11 +601,11 @@ impl Searcher {
                         -alpha,
                         ply + 1,
                         false,
-                        false,
+                        fictional,
                     );
                 }
                 if s > alpha && s < beta {
-                    s = -self.search(&child, next_depth, -beta, -alpha, ply + 1, pv, false);
+                    s = -self.search(&child, next_depth, -beta, -alpha, ply + 1, pv, fictional);
                 }
                 s
             };
@@ -500,9 +628,13 @@ impl Searcher {
                         self.killers[ply][1] = self.killers[ply][0];
                         self.killers[ply][0] = Some(mv);
                     }
-                    let h = &mut self.history[board.side_to_move() as usize][mv.from as usize]
-                        [mv.to as usize];
-                    *h = (*h + depth * depth).min(20_000);
+                    let bonus = (depth * depth * 16).min(HISTORY_LIMIT);
+                    self.update_history(history_side, mv, bonus);
+                    for &failed in &moves[..i] {
+                        if !is_capture(board, failed) {
+                            self.update_history(history_side, failed, -bonus / 2);
+                        }
+                    }
                 }
                 break;
             }
@@ -608,6 +740,53 @@ impl Searcher {
         pv
     }
 }
+
+fn attacks_square(
+    board: &Board,
+    from: cozy_chess::Square,
+    to: cozy_chess::Square,
+    piece: Piece,
+    color: cozy_chess::Color,
+) -> bool {
+    let df = to.file() as i8 - from.file() as i8;
+    let dr = to.rank() as i8 - from.rank() as i8;
+    let diagonal = df != 0 && df.abs() == dr.abs();
+    let straight = (df == 0) != (dr == 0);
+    let attacks = match piece {
+        Piece::Pawn => {
+            dr == if color == cozy_chess::Color::White {
+                1
+            } else {
+                -1
+            } && df.abs() == 1
+        }
+        Piece::Knight => (df.abs() == 1 && dr.abs() == 2) || (df.abs() == 2 && dr.abs() == 1),
+        Piece::King => df.abs() <= 1 && dr.abs() <= 1 && (df != 0 || dr != 0),
+        Piece::Bishop => diagonal,
+        Piece::Rook => straight,
+        Piece::Queen => diagonal || straight,
+    };
+    if !attacks {
+        return false;
+    }
+    if !matches!(piece, Piece::Bishop | Piece::Rook | Piece::Queen) {
+        return true;
+    }
+    let step_file = df.signum();
+    let step_rank = dr.signum();
+    let mut square = from;
+    while let Some(next) = square.try_offset(step_file, step_rank) {
+        if next == to {
+            return true;
+        }
+        if board.occupied() & next.bitboard() != cozy_chess::BitBoard::EMPTY {
+            return false;
+        }
+        square = next;
+    }
+    false
+}
+
 fn score_uci(score: i32) -> String {
     if score.abs() > MATE - 1000 {
         format!(

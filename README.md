@@ -33,8 +33,9 @@ go depth 12
 - Legal move generation and incremental Zobrist hashing from cozy-chess.
 - Iterative deepening, aspiration windows, principal-variation search, alpha-beta pruning, and quiescence search.
 - Persistent transposition table with exact/lower/upper bounds and mate-distance normalization.
-- MVV-LVA capture ordering, hash/PV moves, killer moves, and history heuristic.
-- Tapered material and piece-square evaluation with mobility, king safety, bishop-pair, and pawn-structure terms.
+- Exchange-aware capture ordering, promotions, hash/PV moves, killers, and rewarded/penalized quiet-move history.
+- Tapered material and piece-square evaluation with mobility, king safety, rook activity, bishop-pair, and pawn-structure terms.
+- Repetition and fifty-move draw handling in both full-width and quiescence search; pruning avoids checks and low-material zugzwang positions.
 - Asynchronous search so the UCI loop can receive `stop` while thinking.
 
 ## License

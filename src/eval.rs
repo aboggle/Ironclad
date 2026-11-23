@@ -24,6 +24,12 @@ const DANGER_MELEE: i32 = 6;
 const DANGER_OPEN_FILE: i32 = 12;
 const DANGER_SEMI_OPEN_FILE: i32 = 8;
 const DANGER_ENEMY_MAJOR: i32 = 14;
+const ROOK_OPEN_FILE: i32 = 12;
+const ROOK_SEMI_OPEN_FILE: i32 = 7;
+const ROOK_SEVENTH_RANK: i32 = 12;
+const ROOK_OPEN_FILE_EG: i32 = 6;
+const ROOK_SEMI_OPEN_FILE_EG: i32 = 4;
+const ROOK_SEVENTH_RANK_EG: i32 = 8;
 
 const KNIGHT_DELTAS: [(i8, i8); 8] = [
     (1, 2),
@@ -86,7 +92,9 @@ pub fn evaluate(board: &Board) -> i32 {
         let file = relative.file() as usize;
         let abs_rank = square.rank() as usize;
         let abs_file = square.file() as usize;
-        let center = 7 - (file.abs_diff(3) + rank.abs_diff(3)).min(6);
+        let center_distance =
+            file.abs_diff(3).min(file.abs_diff(4)) + rank.abs_diff(3).min(rank.abs_diff(4));
+        let center = 7 - center_distance;
 
         phase += PHASE_W[piece as usize];
         mg += sign * MG_VAL[piece as usize];
@@ -146,7 +154,7 @@ pub fn evaluate(board: &Board) -> i32 {
         eg += sign * mob * EG_MOB[piece as usize];
     }
 
-    // Pawn structure, king safety and style, per color (white-positive).
+    // Pawn structure and king safety, per color (white-positive).
     let mut white_score = 0i32;
     let mut white_eg = 0i32;
     for color in Color::ALL {
@@ -180,7 +188,11 @@ pub fn evaluate(board: &Board) -> i32 {
             }
             // Passed if no enemy pawn stands ahead on this or an adjacent file.
             let ahead_mask = if color == Color::White {
-                (!0u8).wrapping_shl((abs_rank + 1) as u32)
+                if abs_rank == 7 {
+                    0
+                } else {
+                    u8::MAX << (abs_rank + 1)
+                }
             } else {
                 (1u8 << abs_rank) - 1
             };
@@ -204,6 +216,28 @@ pub fn evaluate(board: &Board) -> i32 {
 
         // Space: advanced pawns (middlegame only, small on purpose).
         white_score += sign * space[ci];
+
+        // Rooks benefit from open files and the seventh rank. Keep the
+        // bonuses modest so tactics and material dominate.
+        for rook in board.pieces(Piece::Rook) {
+            if board.color_on(rook) != Some(color) {
+                continue;
+            }
+            let file = rook.file() as usize;
+            if pawn_mask[ci][file] == 0 {
+                if pawn_mask[1 - ci][file] == 0 {
+                    white_score += sign * ROOK_OPEN_FILE;
+                    white_eg += sign * ROOK_OPEN_FILE_EG;
+                } else {
+                    white_score += sign * ROOK_SEMI_OPEN_FILE;
+                    white_eg += sign * ROOK_SEMI_OPEN_FILE_EG;
+                }
+            }
+            if rook.relative_to(color).rank() as usize == 6 {
+                white_score += sign * ROOK_SEVENTH_RANK;
+                white_eg += sign * ROOK_SEVENTH_RANK_EG;
+            }
+        }
 
         // King danger: concrete pressure, not principles.
         let danger = king_danger(board, occ, color, king_sq[ci], &pawn_mask, &major_mask);
@@ -455,8 +489,7 @@ mod tests {
     #[test]
     fn danger_makes_castling_necessary() {
         // Equal material; a black rook stares down the e-file at the white
-        // king: now castling is concretely better (principles as emergency
-        // measure), while the quiet test above prefers keeping options open.
+        // king, so moving the king away from the pressure should help.
         let pressured = eval("r3r1k1/pppppppp/8/8/8/8/PPPPPPPP/R3K2R w KQ - 0 1");
         let castled = eval("r3r1k1/pppppppp/8/8/8/8/PPPPPPPP/R4RK1 w - - 0 1");
         assert!(
