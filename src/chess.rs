@@ -16,8 +16,20 @@ pub fn is_en_passant(board: &Board, mv: Move) -> bool {
         && board.en_passant() == Some(mv.to.file())
 }
 
+/// cozy-chess encodes castling as the king moving onto its own rook's square
+/// (king-captures-rook). Detect that pattern so castling is never mistaken
+/// for a capture or an attack on the rook.
+pub fn is_castling(board: &Board, mv: Move) -> bool {
+    board.piece_on(mv.from) == Some(Piece::King)
+        && board.color_on(mv.to) == board.color_on(mv.from)
+}
+
 pub fn is_capture(board: &Board, mv: Move) -> bool {
-    board.piece_on(mv.to).is_some() || is_en_passant(board, mv)
+    match board.piece_on(mv.to) {
+        // A same-colored piece on the target square means castling, not a capture.
+        Some(_) => board.color_on(mv.to) != board.color_on(mv.from),
+        None => is_en_passant(board, mv),
+    }
 }
 
 pub fn format_pv(board: &Board, moves: &[Move]) -> String {
@@ -57,5 +69,35 @@ mod tests {
         assert_eq!(board.piece_on(Square::D6), Some(Piece::Pawn));
         assert_eq!(board.piece_on(Square::D5), None);
         assert_eq!(board.piece_on(Square::E5), None);
+    }
+
+    #[test]
+    fn castling_is_not_a_capture() {
+        // cozy-chess encodes castling as king-takes-rook; the target square
+        // holds our own rook, which must not be counted as a capture.
+        let board: Board = "r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1".parse().unwrap();
+        let white_kingside = parse_uci_move(&board, "e1g1").unwrap();
+        assert!(is_castling(&board, white_kingside));
+        assert!(!is_capture(&board, white_kingside));
+
+        let white_queenside = parse_uci_move(&board, "e1c1").unwrap();
+        assert!(is_castling(&board, white_queenside));
+        assert!(!is_capture(&board, white_queenside));
+
+        let black: Board = "r3k2r/8/8/8/8/8/8/R3K2R b KQkq - 0 1".parse().unwrap();
+        let black_kingside = parse_uci_move(&black, "e8g8").unwrap();
+        assert!(is_castling(&black, black_kingside));
+        assert!(!is_capture(&black, black_kingside));
+
+        // Real captures still count.
+        let capture: Board = "r3k2r/8/8/8/8/8/8/R3KQ1R w KQkq - 0 1".parse().unwrap();
+        let rxh8 = parse_uci_move(&capture, "h1h8").unwrap();
+        assert!(!is_castling(&capture, rxh8));
+        assert!(is_capture(&capture, rxh8));
+
+        // Quiet moves stay quiet.
+        let quiet = parse_uci_move(&board, "a1b1").unwrap();
+        assert!(!is_castling(&board, quiet));
+        assert!(!is_capture(&board, quiet));
     }
 }
