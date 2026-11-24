@@ -41,6 +41,30 @@ pub fn format_pv(board: &Board, moves: &[Move]) -> String {
     formatted.join(" ")
 }
 
+/// Count leaf nodes of the legal move tree to `depth` (perft).
+///
+/// Exercises the same cozy-chess generation and castling encoding the search
+/// relies on, so known reference values double as an integration check.
+pub fn perft(board: &Board, depth: u32) -> u64 {
+    if depth == 0 {
+        return 1;
+    }
+    let mut nodes = 0u64;
+    board.generate_moves(|group| {
+        for mv in group {
+            let mut child = board.clone();
+            child.play_unchecked(mv);
+            nodes += if depth == 1 {
+                1
+            } else {
+                perft(&child, depth - 1)
+            };
+        }
+        false
+    });
+    nodes
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -98,5 +122,22 @@ mod tests {
         let quiet = parse_uci_move(&board, "a1b1").unwrap();
         assert!(!is_castling(&board, quiet));
         assert!(!is_capture(&board, quiet));
+    }
+
+    #[test]
+    fn perft_matches_known_node_counts() {
+        // Start position: 20/400/8902 (depth 4 is exercised in tests/perft.rs).
+        let start = Board::default();
+        assert_eq!(perft(&start, 1), 20);
+        assert_eq!(perft(&start, 2), 400);
+        assert_eq!(perft(&start, 3), 8902);
+
+        // Kiwipete: castling, en passant and promotions all in play.
+        let kiwi: Board = "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1"
+            .parse()
+            .unwrap();
+        assert_eq!(perft(&kiwi, 1), 48);
+        assert_eq!(perft(&kiwi, 2), 2039);
+        assert_eq!(perft(&kiwi, 3), 97862);
     }
 }

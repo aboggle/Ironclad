@@ -1,5 +1,6 @@
-//! A small tapered evaluation of material, piece placement, mobility, pawns,
-//! bishop pair, and king safety.
+//! A tapered evaluation of material, piece-square values, mobility, pawns
+//! (structure: doubled, isolated, backward, connected, open files, holes,
+//! passed), bishop pair and blocked bishops, outposts, space and king safety.
 
 use cozy_chess::{BitBoard, Board, Color, Piece, Square};
 
@@ -30,6 +31,27 @@ const ROOK_SEVENTH_RANK: i32 = 12;
 const ROOK_OPEN_FILE_EG: i32 = 6;
 const ROOK_SEMI_OPEN_FILE_EG: i32 = 4;
 const ROOK_SEVENTH_RANK_EG: i32 = 8;
+
+/// Doubled-pawn penalty (per extra pawn on the file).
+const DOUBLED_PENALTY: i32 = 11;
+/// Isolated-pawn penalty.
+const ISOLATED_PENALTY: i32 = 10;
+/// Backward-pawn penalty.
+const BACKWARD_PENALTY: i32 = 10;
+/// Pawn sitting in an enemy pawn chain: attacked by enemy pawns, nothing of
+/// ours defends it.
+const HOLE_PENALTY: i32 = 8;
+/// Bonus for own pawns within one rank on adjacent files ([mg, eg] per pawn).
+const CONNECTED_BONUS: [i32; 2] = [5, 6];
+/// Bonus for a pawn on a file with no enemy pawns ([mg, eg] per pawn).
+const OPEN_FILE_PAWN: [i32; 2] = [2, 1];
+/// Outpost bonus [mg, eg] for knights / bishops on the enemy half.
+const OUTPOST_KNIGHT: [i32; 2] = [12, 8];
+const OUTPOST_BISHOP: [i32; 2] = [8, 6];
+/// Own pawns blocking a bishop's diagonal: [mg, eg] per bishop.
+const BISHOP_BLOCKED_PENALTY: [i32; 2] = [6, 3];
+/// Bishop pair (stronger in the endgame).
+const BISHOP_PAIR: [i32; 2] = [28, 40];
 
 const KNIGHT_DELTAS: [(i8, i8); 8] = [
     (1, 2),
@@ -64,6 +86,147 @@ const QUEEN_DIRS: [(i8, i8); 8] = [
     (0, -1),
 ];
 
+/// Piece-square values by piece ([P, N, B, R, Q, K][rank][file]), white-relative.
+const MG_PST: [[[i32; 8]; 8]; 6] = [
+    // Pawn
+    [
+        [0, 0, 0, 0, 0, 0, 0, 0],
+        [0, 1, 2, 3, 3, 2, 1, 0],
+        [0, 2, 4, 6, 6, 4, 2, 0],
+        [0, 3, 6, 9, 9, 6, 3, 0],
+        [0, 4, 8, 12, 12, 8, 4, 0],
+        [0, 5, 10, 15, 15, 10, 5, 0],
+        [0, 6, 12, 18, 18, 12, 6, 0],
+        [0, 0, 0, 0, 0, 0, 0, 0],
+    ],
+    // Knight
+    [
+        [0, 0, 0, 0, 0, 0, 0, 0],
+        [0, 0, 0, 0, 0, 0, 0, 0],
+        [0, 0, 2, 2, 2, 2, 0, 0],
+        [0, 0, 3, 4, 4, 3, 0, 0],
+        [0, 0, 4, 5, 6, 4, 0, 0],
+        [0, 0, 4, 5, 5, 4, 0, 0],
+        [0, 0, 2, 2, 2, 2, 0, 0],
+        [0, 0, 0, 0, 0, 0, 0, 0],
+    ],
+    // Bishop
+    [
+        [0, 0, 0, 0, 0, 0, 0, 0],
+        [0, 1, 1, 1, 1, 1, 1, 0],
+        [0, 1, 2, 2, 2, 2, 1, 0],
+        [0, 2, 3, 3, 3, 3, 2, 0],
+        [0, 3, 4, 4, 4, 4, 3, 0],
+        [0, 3, 4, 5, 5, 4, 3, 0],
+        [0, 2, 3, 3, 3, 3, 2, 0],
+        [0, 0, 0, 0, 0, 0, 0, 0],
+    ],
+    // Rook
+    [
+        [0, 0, 0, 0, 0, 0, 0, 0],
+        [0, 0, 0, 0, 0, 0, 0, 0],
+        [0, 2, 3, 4, 4, 3, 2, 0],
+        [0, 4, 6, 8, 8, 6, 4, 0],
+        [0, 6, 9, 12, 12, 9, 6, 0],
+        [0, 9, 12, 14, 14, 12, 9, 0],
+        [0, 12, 14, 16, 16, 14, 12, 0],
+        [0, 0, 0, 0, 0, 0, 0, 0],
+    ],
+    // Queen
+    [
+        [0, 0, 0, 0, 0, 0, 0, 0],
+        [0, 0, 0, 0, 0, 0, 0, 0],
+        [0, 2, 3, 3, 3, 3, 2, 0],
+        [0, 4, 7, 9, 9, 7, 4, 0],
+        [0, 6, 10, 12, 12, 10, 6, 0],
+        [0, 9, 13, 16, 16, 13, 9, 0],
+        [0, 12, 15, 18, 18, 15, 12, 0],
+        [0, 0, 0, 0, 0, 0, 0, 0],
+    ],
+    // King: home-square penalty (-20 at E1, -10 at G1, 0 elsewhere); black
+    // kings get the mirrored reward from the color sign flip.
+    [
+        [0, 0, 0, 0, -20, 0, -10, 0],
+        [0, 0, 0, 0, 0, 0, 0, 0],
+        [0, 0, 1, 2, 2, 1, 0, 0],
+        [0, 0, 2, 4, 4, 2, 0, 0],
+        [0, 0, 2, 4, 4, 2, 0, 0],
+        [0, 0, 1, 2, 2, 1, 0, 0],
+        [0, 0, 0, 0, 0, 0, 0, 0],
+        [0, 0, 0, 0, 0, 0, 0, 0],
+    ],
+];
+
+/// Piece-square values by piece ([P, N, B, R, Q, K][rank][file]), white-relative.
+const EG_PST: [[[i32; 8]; 8]; 6] = [
+    // Pawn
+    [
+        [0, 0, 0, 0, 0, 0, 0, 0],
+        [0, 1, 2, 3, 3, 2, 1, 0],
+        [0, 2, 4, 5, 5, 4, 2, 0],
+        [0, 3, 5, 7, 7, 5, 3, 0],
+        [0, 4, 6, 8, 8, 6, 4, 0],
+        [0, 5, 7, 9, 9, 7, 5, 0],
+        [0, 6, 8, 10, 10, 8, 6, 0],
+        [0, 0, 0, 0, 0, 0, 0, 0],
+    ],
+    // Knight
+    [
+        [0, 0, 0, 0, 0, 0, 0, 0],
+        [0, 0, 0, 0, 0, 0, 0, 0],
+        [0, 0, 2, 3, 3, 2, 0, 0],
+        [0, 0, 3, 5, 5, 3, 0, 0],
+        [0, 0, 4, 6, 6, 4, 0, 0],
+        [0, 0, 4, 6, 6, 4, 0, 0],
+        [0, 0, 2, 3, 3, 2, 0, 0],
+        [0, 0, 0, 0, 0, 0, 0, 0],
+    ],
+    // Bishop
+    [
+        [0, 0, 0, 0, 0, 0, 0, 0],
+        [0, 1, 1, 1, 1, 1, 1, 0],
+        [0, 1, 3, 3, 3, 3, 1, 0],
+        [0, 2, 4, 5, 5, 4, 2, 0],
+        [0, 3, 5, 7, 7, 5, 3, 0],
+        [0, 3, 5, 7, 7, 5, 3, 0],
+        [0, 2, 3, 4, 4, 3, 2, 0],
+        [0, 0, 0, 0, 0, 0, 0, 0],
+    ],
+    // Rook
+    [
+        [0, 0, 0, 0, 0, 0, 0, 0],
+        [0, 0, 0, 0, 0, 0, 0, 0],
+        [0, 2, 3, 4, 4, 3, 2, 0],
+        [0, 4, 6, 8, 8, 6, 4, 0],
+        [0, 6, 9, 12, 12, 9, 6, 0],
+        [0, 9, 12, 15, 15, 12, 9, 0],
+        [0, 12, 15, 18, 18, 15, 12, 0],
+        [0, 0, 0, 0, 0, 0, 0, 0],
+    ],
+    // Queen
+    [
+        [0, 0, 0, 0, 0, 0, 0, 0],
+        [0, 0, 0, 0, 0, 0, 0, 0],
+        [0, 2, 4, 5, 5, 4, 2, 0],
+        [0, 4, 8, 11, 11, 8, 4, 0],
+        [0, 6, 12, 15, 15, 12, 6, 0],
+        [0, 9, 15, 18, 18, 15, 9, 0],
+        [0, 12, 17, 20, 20, 17, 12, 0],
+        [0, 0, 0, 0, 0, 0, 0, 0],
+    ],
+    // King
+    [
+        [0, 0, 0, 0, 0, 0, 0, 0],
+        [0, 0, 0, 0, 0, 0, 0, 0],
+        [0, 0, 1, 2, 2, 1, 0, 0],
+        [0, 0, 2, 4, 4, 2, 0, 0],
+        [0, 0, 3, 6, 6, 3, 0, 0],
+        [0, 0, 4, 6, 6, 4, 0, 0],
+        [0, 0, 3, 5, 5, 3, 0, 0],
+        [0, 0, 0, 0, 0, 0, 0, 0],
+    ],
+];
+
 /// Side-to-move relative evaluation in centipawns.
 pub fn evaluate(board: &Board) -> i32 {
     let occ = board.occupied();
@@ -76,8 +239,9 @@ pub fn evaluate(board: &Board) -> i32 {
     let mut bishops = [0u8; 2];
     let mut space = [0i32; 2];
     let mut king_sq = [Square::A1; 2];
+    let mut pawns_of = [BitBoard::EMPTY; 2];
 
-    // Single pass over all pieces: material, position, mobility, structure.
+    // Single pass over all pieces: material, piece-square, mobility, structure.
     for square in Square::ALL {
         let Some(piece) = board.piece_on(square) else {
             continue;
@@ -92,16 +256,19 @@ pub fn evaluate(board: &Board) -> i32 {
         let file = relative.file() as usize;
         let abs_rank = square.rank() as usize;
         let abs_file = square.file() as usize;
-        let center_distance =
-            file.abs_diff(3).min(file.abs_diff(4)) + rank.abs_diff(3).min(rank.abs_diff(4));
-        let center = 7 - center_distance;
 
         phase += PHASE_W[piece as usize];
         mg += sign * MG_VAL[piece as usize];
         eg += sign * EG_VAL[piece as usize];
 
+        // Piece-square values are stored white-relative; the sign makes them
+        // follow the color.
+        mg += sign * MG_PST[piece as usize][rank][file];
+        eg += sign * EG_PST[piece as usize][rank][file];
+
         if piece == Piece::Pawn {
             pawn_mask[ci][abs_file] |= 1 << abs_rank;
+            pawns_of[ci] |= square.bitboard();
             if rank >= 3 {
                 space[ci] += 1;
             }
@@ -115,24 +282,6 @@ pub fn evaluate(board: &Board) -> i32 {
         if piece == Piece::King {
             king_sq[ci] = square;
         }
-
-        // Keep the king safer in the middlegame and centralize it in the endgame.
-        let (pos_mg, pos_eg) = match piece {
-            // Middlegame pawn advancement is deliberately mild: a speculative
-            // flank push must not out-score concrete king safety. Endgame
-            // advancement is where pawn pushes really pay.
-            Piece::Pawn => (
-                rank as i32 * 2 + center as i32 * 2,
-                rank as i32 * 10 + center as i32,
-            ),
-            Piece::Knight => (center as i32 * 7, center as i32 * 5),
-            Piece::Bishop => (center as i32 * 4, center as i32 * 5),
-            Piece::Rook => (rank as i32 * 2, rank as i32 * 3 + center as i32),
-            Piece::Queen => (center as i32 * 2, center as i32 * 3),
-            Piece::King => (-(center as i32) * 5, center as i32 * 7),
-        };
-        mg += sign * pos_mg;
-        eg += sign * pos_eg;
 
         // Mobility: reachable squares for minor pieces and sliders.
         let own = board.colors(color);
@@ -154,67 +303,132 @@ pub fn evaluate(board: &Board) -> i32 {
         eg += sign * mob * EG_MOB[piece as usize];
     }
 
-    // Pawn structure and king safety, per color (white-positive).
+    // Squares attacked by pawns of each color (white-relative tables indexed by ci).
+    let pawn_attacks = [
+        pawn_attacks(Color::White, pawns_of[0]),
+        pawn_attacks(Color::Black, pawns_of[1]),
+    ];
+
+    // Pawn structure, bishop activity and king safety, per color (white-positive).
     let mut white_score = 0i32;
     let mut white_eg = 0i32;
     for color in Color::ALL {
         let ci = usize::from(color == Color::White);
         let sign = if color == Color::White { 1 } else { -1 };
+        let pawns = pawns_of[ci];
 
-        // Doubled and isolated penalties, passed-pawn bonuses.
-        for pawns_on_file in &pawn_mask[ci] {
-            let count = pawns_on_file.count_ones() as i32;
-            white_score -= sign * count.saturating_sub(1) * 11;
+        // Doubled pawns: 2+ pawns on a file cost an extra 11 each.
+        for file in &pawn_mask[ci] {
+            let count = file.count_ones() as i32;
+            white_score -= sign * count.saturating_sub(1) * DOUBLED_PENALTY;
         }
-        for sq in board.pieces(Piece::Pawn) {
+
+        for sq in pawns {
+            let file = sq.file() as usize;
+            let abs_rank = sq.rank() as usize;
+
+            // Isolated: nothing on either adjacent file.
+            if (file == 0 || pawn_mask[ci][file - 1] == 0)
+                && (file == 7 || pawn_mask[ci][file + 1] == 0)
+            {
+                white_score -= sign * ISOLATED_PENALTY;
+            }
+
+            // Backward: no own pawn within one rank on an adjacent file, while
+            // the enemy defends the square this pawn sits on.
+            let supported = (file > 0 && nearby(pawn_mask[ci][file - 1], abs_rank))
+                || (file < 7 && nearby(pawn_mask[ci][file + 1], abs_rank));
+            // White pawns are defended by enemy pawns at abs_rank + 1; black
+            // pawns at abs_rank - 1.
+            let defend_rank = if color == Color::White {
+                Some(abs_rank + 1)
+            } else {
+                abs_rank.checked_sub(1)
+            };
+            let defended = defend_rank.is_some_and(|r| {
+                r < 8
+                    && ((file > 0 && (pawn_mask[1 - ci][file - 1] & (1u8 << r)) != 0)
+                        || (file < 7 && (pawn_mask[1 - ci][file + 1] & (1u8 << r)) != 0))
+            });
+            if !supported && defended {
+                white_score -= sign * BACKWARD_PENALTY;
+            }
+
+            // Connected: own pawn within one rank on an adjacent file.
+            if (file > 0 && nearby(pawn_mask[ci][file - 1], abs_rank))
+                || (file < 7 && nearby(pawn_mask[ci][file + 1], abs_rank))
+            {
+                white_score += sign * CONNECTED_BONUS[0];
+                white_eg += sign * CONNECTED_BONUS[1];
+            }
+
+            // Passed: no enemy pawn ahead on this or an adjacent file.
+            let ahead_mask = forward_mask(color, abs_rank);
+            if [file.saturating_sub(1), file, (file + 1).min(7)]
+                .into_iter()
+                .all(|f| pawn_mask[1 - ci][f] & ahead_mask == 0)
+            {
+                let r = sq.relative_to(color).rank() as i32;
+                white_score += sign * (10 + r * r * 3);
+                white_eg += sign * (12 + r * r * 5);
+            }
+
+            // Open file: no enemy pawn anywhere on this file.
+            if pawn_mask[1 - ci][file] == 0 {
+                white_score += sign * OPEN_FILE_PAWN[0];
+            }
+        }
+
+        // Holes: our pawns in enemy pawn chains — attacked by enemy pawns but
+        // not defended by our own pawns.
+        let holes = pawns & pawn_attacks[1 - ci] & !pawn_attacks[ci];
+        white_score -= sign * holes.len() as i32 * HOLE_PENALTY;
+
+        // Outposts: minors on the enemy half, unreachable by enemy pawns.
+        for (piece, bonus) in [
+            (Piece::Knight, OUTPOST_KNIGHT),
+            (Piece::Bishop, OUTPOST_BISHOP),
+        ] {
+            for sq in board.pieces(piece) {
+                if board.color_on(sq) != Some(color) {
+                    continue;
+                }
+                let rank = sq.relative_to(color).rank() as usize;
+                if !(3..=5).contains(&rank)
+                    || (pawn_attacks[1 - ci] & sq.bitboard()) != BitBoard::EMPTY
+                {
+                    continue;
+                }
+                white_score += sign * bonus[0];
+                white_eg += sign * bonus[1];
+            }
+        }
+
+        // Blocked bishops: own pawns on the bishop's diagonals.
+        for sq in board.pieces(Piece::Bishop) {
             if board.color_on(sq) != Some(color) {
                 continue;
             }
-            let file = sq.file() as usize;
-            let rel_rank = sq.relative_to(color).rank() as usize;
-            let abs_rank = sq.rank() as usize;
-            let left = if file == 0 {
-                0
-            } else {
-                pawn_mask[ci][file - 1]
-            };
-            let right = if file == 7 {
-                0
-            } else {
-                pawn_mask[ci][file + 1]
-            };
-            if left == 0 && right == 0 {
-                white_score -= sign * 10;
-            }
-            // Passed if no enemy pawn stands ahead on this or an adjacent file.
-            let ahead_mask = if color == Color::White {
-                if abs_rank == 7 {
-                    0
-                } else {
-                    u8::MAX << (abs_rank + 1)
-                }
-            } else {
-                (1u8 << abs_rank) - 1
-            };
-            let passed = pawn_mask[1 - ci]
+            let blocked = pawns
                 .iter()
-                .take((file + 1).min(7) + 1)
-                .skip(file.saturating_sub(1))
-                .all(|&pawns| pawns & ahead_mask == 0);
-            if passed {
-                let r = rel_rank as i32;
-                white_score += sign * (10 + r * r * 3);
-                white_eg += sign * (12 + r * r * 5);
+                .filter(|p| {
+                    (p.file() as usize).abs_diff(sq.file() as usize)
+                        == (p.rank() as usize).abs_diff(sq.rank() as usize)
+                })
+                .count();
+            if blocked > 0 {
+                white_score -= sign * BISHOP_BLOCKED_PENALTY[0];
+                white_eg -= sign * BISHOP_BLOCKED_PENALTY[1];
             }
         }
 
         // Bishop pair (stronger in the endgame).
         if bishops[ci] >= 2 {
-            white_score += sign * 28;
-            white_eg += sign * 40;
+            white_score += sign * BISHOP_PAIR[0];
+            white_eg += sign * BISHOP_PAIR[1];
         }
 
-        // Space: advanced pawns (middlegame only, small on purpose).
+        // Space: advanced pawns, middlegame only (small on purpose).
         white_score += sign * space[ci];
 
         // Rooks benefit from open files and the seventh rank. Keep the
@@ -243,12 +457,6 @@ pub fn evaluate(board: &Board) -> i32 {
         let danger = king_danger(board, occ, color, king_sq[ci], &pawn_mask, &major_mask);
         white_score -= sign * danger;
         white_eg -= sign * danger * 2 / 5;
-
-        // A king marching forward in the middlegame is a liability.
-        let rel_rank = king_sq[ci].relative_to(color).rank() as usize;
-        if rel_rank >= 3 {
-            white_score -= sign * ((rel_rank - 2) as i32) * 10;
-        }
     }
 
     mg += white_score;
@@ -262,6 +470,38 @@ pub fn evaluate(board: &Board) -> i32 {
         -score
     };
     relative + TEMPO
+}
+
+/// Squares attacked by the pawns of `color`.
+fn pawn_attacks(color: Color, pawns: BitBoard) -> BitBoard {
+    let dr = if color == Color::White { 1 } else { -1 };
+    let mut bb = BitBoard::EMPTY;
+    for sq in pawns {
+        for df in [-1i8, 1] {
+            if let Some(t) = sq.try_offset(df, dr) {
+                bb |= t.bitboard();
+            }
+        }
+    }
+    bb
+}
+
+/// Does a file mask have a pawn within one rank of `rank`?
+fn nearby(file_mask: u8, rank: usize) -> bool {
+    (rank.saturating_sub(1)..=(rank + 1).min(7)).any(|r| file_mask & (1u8 << r) != 0)
+}
+
+/// Mask of absolute ranks in front of a pawn (ranks the pawn advances into).
+fn forward_mask(color: Color, abs_rank: usize) -> u8 {
+    if color == Color::White {
+        if abs_rank >= 7 {
+            0
+        } else {
+            u8::MAX << (abs_rank + 1)
+        }
+    } else {
+        (1u8 << abs_rank) - 1
+    }
 }
 
 fn slider_mobility(from: Square, dirs: &[(i8, i8)], occ: BitBoard, own: BitBoard) -> i32 {
@@ -490,11 +730,47 @@ mod tests {
     fn danger_makes_castling_necessary() {
         // Equal material; a black rook stares down the e-file at the white
         // king, so moving the king away from the pressure should help.
-        let pressured = eval("r3r1k1/pppppppp/8/8/8/8/PPPPPPPP/R3K2R w KQ - 0 1");
+        let pressured = eval("r3r1k1/pppppppp/8/8/8/8/PPPPPPPP/R3K2R w - - 0 1");
         let castled = eval("r3r1k1/pppppppp/8/8/8/8/PPPPPPPP/R4RK1 w - - 0 1");
         assert!(
             castled > pressured,
             "castled {castled} should beat staying {pressured} under pressure"
+        );
+    }
+
+    #[test]
+    fn connected_pawns_beat_isolated_ones() {
+        // White pawns at D5 and C4: each is within one rank of an own pawn
+        // on an adjacent file, so both are connected.
+        let connected = eval("8/8/8/3P4/2P5/3k4/8/5K2 w - - 0 1");
+        // Same white pawn on D5 alone (no adjacent-file neighbor): isolated.
+        let isolated = eval("8/8/8/3P4/8/3k4/8/5K2 w - - 0 1");
+        assert!(
+            connected > isolated,
+            "connected {connected} should beat isolated {isolated}"
+        );
+    }
+
+    #[test]
+    fn passed_pawns_are_credited_extra() {
+        // White pawn on D5 with no pawns ahead: passed (bonus 10 + 4^2 * 3).
+        let passed = eval("8/8/8/3k4/8/3P4/8/3K4 w - - 0 1");
+        // Black pawn at D6 sits ahead of the white pawn on D5: it blocks the
+        // white pawn and the white pawn also sits in an enemy pawn chain.
+        let blocked = eval("8/8/8/3p4/3P4/3k4/8/3K4 w - - 0 1");
+        assert!(
+            passed > blocked + 100,
+            "passed {passed} should beat blocked {blocked} + 100"
+        );
+    }
+
+    #[test]
+    fn bishop_pair_is_rewarded() {
+        let pair = eval("8/8/8/3k4/8/8/8/3BBK2 w - - 0 1");
+        let solo = eval("8/8/8/3k4/8/8/8/3B1K2 w - - 0 1");
+        assert!(
+            pair - solo > 300,
+            "bishop pair {pair} should beat one bishop {solo} by > 300"
         );
     }
 }

@@ -102,6 +102,11 @@ impl Tt {
     }
 }
 
+/// Square-pair index (0..4096) for counter-move heuristics.
+fn move_index(mv: Move) -> usize {
+    mv.from as usize * 64 + mv.to as usize
+}
+
 /// Shared state passed to the asynchronous search.
 #[derive(Clone)]
 pub struct SearchParams {
@@ -110,6 +115,8 @@ pub struct SearchParams {
     pub deadline: Arc<Mutex<Option<Instant>>>,
     /// Hashes of the positions before the root, for repetition detection.
     pub root_history: Vec<u64>,
+    /// Hard node budget for the search; `u64::MAX` means unlimited.
+    pub max_nodes: u64,
 }
 
 pub struct Searcher {
@@ -117,9 +124,11 @@ pub struct Searcher {
     nodes: u64,
     stop: Arc<AtomicBool>,
     deadline: Arc<Mutex<Option<Instant>>>,
+    max_nodes: u64,
     started: Instant,
     killers: [[Option<Move>; 2]; MAX_PLY],
     history: [[[i32; 64]; 64]; 2],
+    counters: [[Option<Move>; 4096]; 2],
 
     root_best: Option<Move>,
     seldepth: usize,
@@ -135,9 +144,11 @@ impl Searcher {
             nodes: 0,
             stop: p.stop,
             deadline: p.deadline,
+            max_nodes: p.max_nodes,
             started: Instant::now(),
             killers: [[None; 2]; MAX_PLY],
             history: [[[0; 64]; 64]; 2],
+            counters: [[None; 4096]; 2],
             root_best: None,
             seldepth: 0,
             root_history: p.root_history,
@@ -154,6 +165,9 @@ impl Searcher {
             .unwrap_or(false)
     }
     fn poll(&mut self) -> bool {
+        if self.nodes > self.max_nodes {
+            self.stop.store(true, Ordering::Relaxed);
+        }
         if self.nodes & 2047 == 0 && self.stopped() {
             self.stop.store(true, Ordering::Relaxed);
         }
@@ -321,14 +335,17 @@ impl Searcher {
             if is_capture(board, m) {
                 let see = Self::static_exchange(board, m);
                 let good_capture_bonus = if see >= 0 { 1_000_000 } else { 100_000 };
-                return good_capture_bonus + see * 8 + Self::capture_value(board, m);
+                return good_capture_bonus + see * 12 + Self::capture_value(board, m);
             }
             if let Some(promotion) = m.promotion {
                 return 900_000 + Self::static_exchange(board, m) + VALUES[promotion as usize];
             }
             // Castling is quiet but worth finding early.
             if is_castling(board, m) {
-                return 850_000;
+                return 830_000;
+            }
+            if ply < MAX_PLY && self.counters[side][move_index(m)] == Some(m) {
+                return 720_000;
             }
             if ply < MAX_PLY && self.killers[ply][0] == Some(m) {
                 return 800_000;
@@ -415,24 +432,23 @@ impl Searcher {
         if moves.is_empty() {
             return if in_check { -MATE + ply as i32 } else { 0 };
         }
-        self.order(board, &mut moves, None, ply);
+        let tt_move = self.tt.probe(key).and_then(|e| e.best);
+        self.order(board, &mut moves, tt_move, ply);
         for mv in moves {
             if !in_check && !is_capture(board, mv) && mv.promotion.is_none() {
                 continue;
             }
             let mut child = board.clone();
             child.play_unchecked(mv);
-            // Keep checking captures out of delta pruning because their
-            // tactical value may exceed the material on the target square.
-            if !in_check && mv.promotion.is_none() && child.checkers().is_empty() {
-                let victim = if is_en_passant(board, mv) {
-                    VALUES[Piece::Pawn as usize]
-                } else {
-                    board.piece_on(mv.to).map_or(0, |p| VALUES[p as usize])
-                };
-                if stand + victim + 200 < alpha {
-                    continue;
-                }
+            // Delta pruning: skip quiet captures that can't realistically
+            // bring us above alpha — the SEE value already includes any
+            // recapture margin.
+            if !in_check
+                && mv.promotion.is_none()
+                && child.checkers().is_empty()
+                && stand + Self::static_exchange(board, mv) < alpha
+            {
+                continue;
             }
             let score = -self.quiescence(&child, -beta, -alpha, ply + 1, fictional);
             if self.stop.load(Ordering::Relaxed) {
@@ -455,6 +471,7 @@ impl Searcher {
         ply: usize,
         pv: bool,
         fictional: bool,
+        excluded: Option<Move>,
     ) -> i32 {
         if depth <= 0 {
             return self.quiescence(board, alpha, beta, ply, fictional);
@@ -511,6 +528,7 @@ impl Searcher {
                     ply + 1,
                     false,
                     true,
+                    None,
                 );
                 if self.stop.load(Ordering::Relaxed) {
                     return alpha;
@@ -523,7 +541,8 @@ impl Searcher {
                             0
                         };
                     }
-                    let verify = self.search(board, depth - 1, beta - 1, beta, ply, pv, fictional);
+                    let verify =
+                        self.search(board, depth - 1, beta - 1, beta, ply, pv, fictional, None);
                     if verify >= beta {
                         return verify;
                     }
@@ -558,6 +577,9 @@ impl Searcher {
         let mut legal = 0;
         let history_side = board.side_to_move() as usize;
         for (i, mv) in moves.iter().copied().enumerate() {
+            if excluded == Some(mv) {
+                continue;
+            }
             let capture = is_capture(board, mv);
             let pawn_move = board.piece_on(mv.from) == Some(Piece::Pawn);
             let castling = is_castling(board, mv);
@@ -570,30 +592,59 @@ impl Searcher {
                 next_depth += 1;
             }
             let score = if i == 0 {
-                -self.search(&child, next_depth, -beta, -alpha, ply + 1, pv, fictional)
+                // Singular extension: if no alternative reaches alpha on its
+                // own, the PV move is singular and deserves an extra depth.
+                if pv && depth >= 10 && !capture && !gives_check {
+                    let probe = self.search(
+                        &child,
+                        depth - 2,
+                        alpha,
+                        alpha + 1,
+                        ply + 1,
+                        false,
+                        fictional,
+                        Some(mv),
+                    );
+                    if probe < alpha + 1 {
+                        next_depth += 1;
+                    }
+                }
+                -self.search(
+                    &child,
+                    next_depth,
+                    -beta,
+                    -alpha,
+                    ply + 1,
+                    pv,
+                    fictional,
+                    None,
+                )
             } else {
-                let reduction = if depth >= 3
-                    && i >= 4
-                    && !capture
-                    && !pawn_move
-                    && !castling
-                    && !in_check
-                    && !gives_check
-                {
-                    1 + (i >= 10 && depth >= 6) as i32
-                } else {
-                    0
-                };
+                // Lower the reduction on moves whose history is promising.
+                let mut red = 0i32;
+                if depth >= 3 {
+                    if i >= 4 && !capture && !pawn_move && !castling && !in_check && !gives_check {
+                        red = 1 + (i >= 10 && depth >= 6) as i32;
+                        if self.history[history_side][mv.from as usize][mv.to as usize]
+                            < -HISTORY_LIMIT / 4
+                        {
+                            red += 1;
+                        }
+                    } else if is_capture(board, mv) && Self::static_exchange(board, mv) < 0 {
+                        red = 1;
+                    }
+                }
                 let mut s = -self.search(
                     &child,
-                    (next_depth - reduction).max(0),
+                    (next_depth - red).max(0),
                     -alpha - 1,
                     -alpha,
                     ply + 1,
                     false,
                     fictional,
+                    None,
                 );
-                if s > alpha && reduction > 0 {
+                if s > alpha && red > 0 {
                     s = -self.search(
                         &child,
                         next_depth,
@@ -602,10 +653,20 @@ impl Searcher {
                         ply + 1,
                         false,
                         fictional,
+                        None,
                     );
                 }
                 if s > alpha && s < beta {
-                    s = -self.search(&child, next_depth, -beta, -alpha, ply + 1, pv, fictional);
+                    s = -self.search(
+                        &child,
+                        next_depth,
+                        -beta,
+                        -alpha,
+                        ply + 1,
+                        pv,
+                        fictional,
+                        None,
+                    );
                 }
                 s
             };
@@ -624,6 +685,7 @@ impl Searcher {
             }
             if alpha >= beta {
                 if !capture && ply < MAX_PLY {
+                    self.counters[history_side][move_index(mv)] = Some(mv);
                     if self.killers[ply][0] != Some(mv) {
                         self.killers[ply][1] = self.killers[ply][0];
                         self.killers[ply][0] = Some(mv);
@@ -656,7 +718,7 @@ impl Searcher {
         let mut best = Self::generate(&board).first().copied();
         let mut prev = 0;
         for depth in 1..=max_depth.min(120) {
-            if self.stopped() {
+            if self.stopped() || self.nodes > self.max_nodes {
                 break;
             }
             self.seldepth = 0;
@@ -669,15 +731,25 @@ impl Searcher {
             let mut score;
             loop {
                 self.root_best = best;
-                score = self.search(&board, depth as i32, alpha, beta, 0, true, false);
+                score = self.search(&board, depth as i32, alpha, beta, 0, true, false, None);
                 if self.stop.load(Ordering::Relaxed) {
                     break;
                 }
                 if score <= alpha && alpha > -INF {
+                    eprintln!(
+                        "info string aspiration depth {} score {}: lowering window",
+                        depth,
+                        score_uci(score)
+                    );
                     alpha = -INF;
                     continue;
                 }
                 if score >= beta && beta < INF {
+                    eprintln!(
+                        "info string aspiration depth {} score {}: raising window",
+                        depth,
+                        score_uci(score)
+                    );
                     beta = INF;
                     continue;
                 }

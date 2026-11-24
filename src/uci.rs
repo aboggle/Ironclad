@@ -16,6 +16,7 @@ struct Limits {
     winc: u64,
     binc: u64,
     movestogo: Option<u64>,
+    nodes: u64,
     infinite: bool,
 }
 impl Default for Limits {
@@ -28,6 +29,7 @@ impl Default for Limits {
             winc: 0,
             binc: 0,
             movestogo: None,
+            nodes: u64::MAX,
             infinite: false,
         }
     }
@@ -77,6 +79,12 @@ fn parse_go(words: &[&str]) -> Limits {
             "movestogo" => {
                 if let Some(v) = val {
                     l.movestogo = Some(v);
+                    i += 1;
+                }
+            }
+            "nodes" => {
+                if let Some(v) = val {
+                    l.nodes = v.max(1);
                     i += 1;
                 }
             }
@@ -213,6 +221,18 @@ pub fn run() {
                 // The root position itself must not count as its own history.
                 history.pop();
             }
+            "go" if parts.get(1) == Some(&"perft") => {
+                // Common UCI extension: node counts for the current position.
+                if let Some(depth) = parts.get(2).and_then(|s| s.parse::<u32>().ok()) {
+                    let start = Instant::now();
+                    let nodes = crate::chess::perft(&board, depth);
+                    println!(
+                        "info string perft nodes {} time {}",
+                        nodes,
+                        start.elapsed().as_millis()
+                    );
+                }
+            }
             "go" => {
                 stop_search(&mut search);
                 let l = parse_go(&parts);
@@ -227,6 +247,7 @@ pub fn run() {
                     stop: flag.clone(),
                     deadline: dl.clone(),
                     root_history: history.clone(),
+                    max_nodes: l.nodes,
                 };
                 let b = board.clone();
                 let depth = l.depth;
